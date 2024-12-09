@@ -2,19 +2,38 @@ from typing import Any, Callable, Dict, List, Tuple, Union, get_type_hints, get_
 from functools import wraps
 import collections.abc
 
-
 class StrictTypeError(TypeError):
-    def __init__(self, message: str, method_name: str, param_name: str, received_type: type):
-        self.message = f"{message} in method '{method_name}' for parameter '{param_name}'. Expected {type(received_type).__name__}, but got {received_type.__name__}."
+    def __init__(self, message: str, method_name: str, param_name: str, received_type: type, value: Any, code: int):
+        self.message = (
+            f"[Error Code {code}] {message}\n"
+            f"In method '{method_name}', parameter '{param_name}': "
+            f"Expected {type.__name__}, but got {type(value).__name__} "
+            f"with value '{value}'."
+        )
         super().__init__(self.message)
 
-
 class strictMeta(type):
+    type_coercion_enabled = False
+    range_validators = {}
+    condition_validators = {}
+
     def __new__(cls, name, bases, dct):
         for attrName, attrValue in dct.items():
             if callable(attrValue) and not isinstance(attrValue, (staticmethod, classmethod)):
                 dct[attrName] = cls._wrapMethod(attrValue)
         return super().__new__(cls, name, bases, dct)
+
+    @staticmethod
+    def enableTypeCoercion(enable: bool = True):
+        strictMeta.type_coercion_enabled = enable
+
+    @staticmethod
+    def addRangeValidator(type_: type, min_value: Optional[int] = None, max_value: Optional[int] = None):
+        strictMeta.range_validators[type_] = (min_value, max_value)
+
+    @staticmethod
+    def addConditionValidator(type_: type, condition: Callable[[Any], bool]):
+        strictMeta.condition_validators[type_] = condition
 
     @staticmethod
     def _wrapMethod(method: Callable):
@@ -42,47 +61,86 @@ class strictMeta(type):
             originType = get_origin(expectedType)
             argsType = get_args(expectedType)
 
-            # Handle nullable types (Optional)
-            if isinstance(expectedType, Union) and type(None) in argsType:
-                argsType.remove(type(None))  # Allow NoneType
-                if value is None:
-                    return
+            if strictMeta.type_coercion_enabled:
+                try:
+                    value = expectedType(value)
+                except Exception:
+                    pass
 
-            # Validate Tuple, List, Dict
             if isinstance(value, collections.abc.Mapping):
                 if originType is dict:
-                    if not isinstance(value, dict):
-                        raise StrictTypeError(f"'{name}' must be of type dict, but got {type(value).__name__}.", method_name, name, type(value))
                     key_type, value_type = argsType
                     for key, val in value.items():
-                        if not isinstance(key, key_type):
-                            raise StrictTypeError(f"Key in '{name}' must be of type {key_type.__name__}, but got {type(key).__name__}.", method_name, name, type(key))
-                        if not isinstance(val, value_type):
-                            raise StrictTypeError(f"Value in '{name}' must be of type {value_type.__name__}, but got {type(val).__name__}.", method_name, name, type(val))
+                        strictMeta._validateType(name, key, {name: key_type}, method_name)
+                        strictMeta._validateType(name, val, {name: value_type}, method_name)
                 return
 
-            elif isinstance(value, collections.abc.Sequence):
+            if isinstance(value, collections.abc.Sequence):
                 if originType in {list, tuple}:
-                    if not isinstance(value, originType):
-                        raise StrictTypeError(f"'{name}' must be of type {originType.__name__}, but got {type(value).__name__}.", method_name, name, type(value))
                     if argsType:
                         for item in value:
-                            if not isinstance(item, argsType[0]):
-                                raise StrictTypeError(f"Items in '{name}' must be of type {argsType[0].__name__}, but got {type(item).__name__}.", method_name, name, type(item))
+                            strictMeta._validateType(name, item, {name: argsType[0]}, method_name)
                 return
 
-            # For other cases, fall back to standard type checking
-            if not isinstance(value, expectedType):
-                raise StrictTypeError(f"'{name}' must be of type {expectedType.__name__}, but got {type(value).__name__}.", method_name, name, type(value))
+            if expectedType in strictMeta.range_validators:
+                min_value, max_value = strictMeta.range_validators[expectedType]
+                if isinstance(value, (int, float)):
+                    if min_value is not None and value < min_value:
+                        raise StrictTypeError(
+                            f"'{name}' must be greater than or equal to {min_value}.",
+                            method_name,
+                            name,
+                            expectedType,
+                            value,
+                            code=105,
+                        )
+                    if max_value is not None and value > max_value:
+                        raise StrictTypeError(
+                            f"'{name}' must be less than or equal to {max_value}.",
+                            method_name,
+                            name,
+                            expectedType,
+                            value,
+                            code=106,
+                        )
 
+            if expectedType in strictMeta.condition_validators:
+                condition = strictMeta.condition_validators[expectedType]
+                if not condition(value):
+                    raise StrictTypeError(
+                        f"'{name}' does not satisfy the condition.",
+                        method_name,
+                        name,
+                        expectedType,
+                        value,
+                        code=107,
+                    )
+
+            if not isinstance(value, expectedType):
+                raise StrictTypeError(
+                    f"'{name}' must be of type {expectedType.__name__}.",
+                    method_name,
+                    name,
+                    expectedType,
+                    value,
+                    code=104,
+                )
 
 class strictClass(metaclass=strictMeta):
     def __setattr__(self, name, value):
+        if hasattr(self, name):
+            raise StrictTypeError(
+                f"Cannot modify immutable attribute '{name}'",
+                self.__class__.__name__,
+                name,
+                type(value),
+                value,
+                code=108,
+            )
         classHints = get_type_hints(self.__class__)
         if name in classHints:
             strictMeta._validateType(name, value, classHints, self.__class__.__name__)
         super().__setattr__(name, value)
-
 
 def strictFunction(func: Callable):
     funcHints = get_type_hints(func)
