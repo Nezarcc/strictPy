@@ -3,19 +3,22 @@ from functools import wraps
 import collections.abc
 
 class StrictTypeError(TypeError):
-    def __init__(self, message: str, method_name: str, param_name: str, received_type: type, value: Any, code: int):
+    def __init__(self, message: str, method_name: str, param_name: str, received_type: type, value: Any, code: int, context: Optional[str] = None):
         self.message = (
             f"[Error Code {code}] {message}\n"
             f"In method '{method_name}', parameter '{param_name}': "
             f"Expected {type.__name__}, but got {type(value).__name__} "
             f"with value '{value}'."
         )
+        if context:
+            self.message += f"\nContext: {context}"
         super().__init__(self.message)
 
 class strictMeta(type):
     type_coercion_enabled = False
     range_validators = {}
     condition_validators = {}
+    custom_validators = {}
 
     def __new__(cls, name, bases, dct):
         for attrName, attrValue in dct.items():
@@ -34,6 +37,10 @@ class strictMeta(type):
     @staticmethod
     def addConditionValidator(type_: type, condition: Callable[[Any], bool]):
         strictMeta.condition_validators[type_] = condition
+
+    @staticmethod
+    def addCustomValidator(type_: type, validator: Callable[[Any], bool]):
+        strictMeta.custom_validators[type_] = validator
 
     @staticmethod
     def _wrapMethod(method: Callable):
@@ -55,7 +62,7 @@ class strictMeta(type):
         return wrapper
 
     @staticmethod
-    def _validateType(name: str, value: Any, hints: Dict, method_name: str):
+    def _validateType(name: str, value: Any, hints: Dict, method_name: str, context: Optional[str] = None):
         expectedType = hints.get(name)
         if expectedType:
             originType = get_origin(expectedType)
@@ -71,15 +78,15 @@ class strictMeta(type):
                 if originType is dict:
                     key_type, value_type = argsType
                     for key, val in value.items():
-                        strictMeta._validateType(name, key, {name: key_type}, method_name)
-                        strictMeta._validateType(name, val, {name: value_type}, method_name)
+                        strictMeta._validateType(name, key, {name: key_type}, method_name, context)
+                        strictMeta._validateType(name, val, {name: value_type}, method_name, context)
                 return
 
             if isinstance(value, collections.abc.Sequence):
                 if originType in {list, tuple}:
                     if argsType:
                         for item in value:
-                            strictMeta._validateType(name, item, {name: argsType[0]}, method_name)
+                            strictMeta._validateType(name, item, {name: argsType[0]}, method_name, context)
                 return
 
             if expectedType in strictMeta.range_validators:
@@ -93,6 +100,7 @@ class strictMeta(type):
                             expectedType,
                             value,
                             code=105,
+                            context=context,
                         )
                     if max_value is not None and value > max_value:
                         raise StrictTypeError(
@@ -102,6 +110,7 @@ class strictMeta(type):
                             expectedType,
                             value,
                             code=106,
+                            context=context,
                         )
 
             if expectedType in strictMeta.condition_validators:
@@ -114,6 +123,20 @@ class strictMeta(type):
                         expectedType,
                         value,
                         code=107,
+                        context=context,
+                    )
+
+            if expectedType in strictMeta.custom_validators:
+                validator = strictMeta.custom_validators[expectedType]
+                if not validator(value):
+                    raise StrictTypeError(
+                        f"'{name}' failed custom validation.",
+                        method_name,
+                        name,
+                        expectedType,
+                        value,
+                        code=109,
+                        context=context,
                     )
 
             if not isinstance(value, expectedType):
@@ -124,6 +147,7 @@ class strictMeta(type):
                     expectedType,
                     value,
                     code=104,
+                    context=context,
                 )
 
 class strictClass(metaclass=strictMeta):
